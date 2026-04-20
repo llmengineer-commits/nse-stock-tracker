@@ -1,0 +1,58 @@
+id: nse_dbt_manual_run
+namespace: ian.capstone
+
+description: |
+  Run dbt transformations on demand — useful when you want to refresh
+  the dashboard mid-day or after backfilling historical data.
+  
+  Trigger this manually from the Kestra UI at http://localhost:8082
+  or via the API: POST /api/v1/executions/ian.capstone/nse_dbt_manual_run
+
+labels:
+  project: nse-stock-tracker
+  type: manual
+
+inputs:
+  - id: select_models
+    type: STRING
+    description: "dbt --select argument. Leave blank to run all models."
+    defaults: ""
+    required: false
+
+tasks:
+
+  - id: resolve_select
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.select_models != '' }}"
+    then:
+      - id: run_selected
+        type: io.kestra.plugin.scripts.shell.Commands
+        commands:
+          - |
+            docker compose -f /path/to/nse-stock-tracker/docker-compose.yml \
+              run --rm dbt dbt run \
+              --select {{ inputs.select_models }} \
+              --profiles-dir /usr/app/dbt \
+              --project-dir /usr/app/dbt
+    else:
+      - id: run_all
+        type: io.kestra.plugin.scripts.shell.Commands
+        commands:
+          - |
+            docker compose -f /path/to/nse-stock-tracker/docker-compose.yml \
+              run --rm dbt dbt run \
+              --profiles-dir /usr/app/dbt \
+              --project-dir /usr/app/dbt
+
+  - id: run_tests
+    type: io.kestra.plugin.scripts.shell.Commands
+    commands:
+      - |
+        docker compose -f /path/to/nse-stock-tracker/docker-compose.yml \
+          run --rm dbt dbt test \
+          --profiles-dir /usr/app/dbt \
+          --project-dir /usr/app/dbt
+
+  - id: done
+    type: io.kestra.plugin.core.log.Log
+    message: "dbt run complete. Refresh your Looker Studio dashboard to see updated data."

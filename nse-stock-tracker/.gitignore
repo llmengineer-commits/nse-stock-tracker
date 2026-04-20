@@ -1,0 +1,22 @@
+# Secrets — never commit these
+.env
+
+# dbt build artifacts
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Docker volumes (if accidentally created locally)
+clickhouse-data/
+redpanda-data/
+
+# IDE
+.vscode/
+.idea/
+*.swp

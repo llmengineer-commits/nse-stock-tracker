@@ -1,0 +1,236 @@
+id: nse_stock_pipeline
+namespace: ian.capstone
+
+description: |
+  NSE Kenya Stock Tracker — Main Orchestration Flow
+  
+  This flow does three things:
+    1. Health-checks all services at market open (09:00 EAT)
+    2. Monitors the producer and Flink job during trading hours
+    3. Triggers dbt transformations after market close (15:35 EAT)
+  
+  Schedule: Mon–Fri only. Saturdays and Sundays are skipped automatically
+  by Kestra's cron trigger — NSE doesn't trade on weekends.
+  
+  Ian Nyaga | The Hague Internet Services | DE Zoomcamp 2026
+
+labels:
+  project: nse-stock-tracker
+  env: production
+  owner: ian
+
+# ── Variables ──────────────────────────────────────────────────────────────
+variables:
+  redpanda_broker: "redpanda:29092"
+  clickhouse_host: "clickhouse"
+  clickhouse_port: "8123"
+  clickhouse_db: "nse"
+  topic: "nse.raw.ticks"
+
+# ── Triggers ───────────────────────────────────────────────────────────────
+triggers:
+  # Fire at 09:00 EAT (= 06:00 UTC) Mon–Fri
+  - id: market_open_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * 1-5"
+    timezone: Africa/Nairobi
+
+  # Fire at 15:35 EAT (= 12:35 UTC) Mon–Fri — 5 minutes after close
+  - id: market_close_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "35 12 * * 1-5"
+    timezone: Africa/Nairobi
+
+# ── Tasks ──────────────────────────────────────────────────────────────────
+tasks:
+
+  # ── MARKET OPEN: health checks ───────────────────────────────────────────
+
+  - id: check_redpanda
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Ping Redpanda admin API — confirms the broker is alive"
+    commands:
+      - |
+        STATUS=$(curl -sf http://{{ vars.redpanda_broker | replace(':29092', ':9644') }}/v1/cluster/health_overview | python3 -c "import sys,json; d=json.load(sys.stdin); print('healthy' if d.get('is_healthy') else 'unhealthy')" 2>/dev/null || echo "unreachable")
+        echo "Redpanda status: $STATUS"
+        if [ "$STATUS" != "healthy" ]; then
+          echo "ERROR: Redpanda is not healthy!"
+          exit 1
+        fi
+
+  - id: check_clickhouse
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Ping ClickHouse HTTP interface"
+    commands:
+      - |
+        RESPONSE=$(curl -sf "http://{{ vars.clickhouse_host }}:{{ vars.clickhouse_port }}/ping" || echo "fail")
+        echo "ClickHouse ping: $RESPONSE"
+        if [ "$RESPONSE" != "Ok." ]; then
+          echo "ERROR: ClickHouse is not responding!"
+          exit 1
+        fi
+
+  - id: check_topic_exists
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Verify the nse.raw.ticks topic exists in Redpanda"
+    commands:
+      - |
+        TOPICS=$(docker exec nse_redpanda rpk topic list --brokers {{ vars.redpanda_broker }} 2>/dev/null || echo "")
+        if echo "$TOPICS" | grep -q "{{ vars.topic }}"; then
+          echo "Topic '{{ vars.topic }}' confirmed."
+        else
+          echo "WARNING: Topic '{{ vars.topic }}' not found. Creating it..."
+          docker exec nse_redpanda rpk topic create {{ vars.topic }} \
+            --brokers {{ vars.redpanda_broker }} \
+            --partitions 3 \
+            --replicas 1
+        fi
+
+  - id: log_market_open
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ✅ All health checks passed at market open.
+      NSE is now open (09:00 EAT). Producer and Flink are running.
+      Monitoring tick flow until 15:30 EAT.
+
+  # ── MID-DAY: spot check on tick ingestion ────────────────────────────────
+
+  - id: check_tick_count
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Query ClickHouse to confirm ticks are flowing in today"
+    script: |
+      import clickhouse_connect
+      from datetime import date
+
+      client = clickhouse_connect.get_client(
+          host="{{ vars.clickhouse_host }}",
+          port={{ vars.clickhouse_port }},
+          database="{{ vars.clickhouse_db }}",
+          username="{{ secret('CLICKHOUSE_USER') }}",
+          password="{{ secret('CLICKHOUSE_PASSWORD') }}",
+      )
+
+      today = date.today().isoformat()
+      result = client.query(
+          "SELECT count() as cnt, countDistinct(ticker) as tickers "
+          "FROM raw_ticks "
+          "WHERE toDate(inserted_at) = today()"
+      )
+
+      row = result.first_row
+      tick_count  = row[0]
+      ticker_count = row[1]
+
+      print(f"Today's ticks so far: {tick_count:,} rows across {ticker_count} tickers")
+
+      if tick_count == 0:
+          raise ValueError(
+              "No ticks found for today! "
+              "Check that the producer container is running."
+          )
+
+  # ── MARKET CLOSE: run dbt transformations ────────────────────────────────
+
+  - id: dbt_run_staging
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Run dbt staging models — clean and validate raw data"
+    commands:
+      - |
+        docker compose -f /path/to/nse-stock-tracker/docker-compose.yml \
+          run --rm dbt \
+          dbt run --select staging \
+          --profiles-dir /usr/app/dbt \
+          --project-dir /usr/app/dbt
+    env:
+      CLICKHOUSE_HOST: "{{ vars.clickhouse_host }}"
+      CLICKHOUSE_PORT: "{{ vars.clickhouse_port }}"
+      CLICKHOUSE_DB: "{{ vars.clickhouse_db }}"
+      CLICKHOUSE_USER: "{{ secret('CLICKHOUSE_USER') }}"
+      CLICKHOUSE_PASSWORD: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+
+  - id: dbt_run_marts
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Run dbt mart models — build fct_nse_daily_summary and fct_nse_top_movers"
+    commands:
+      - |
+        docker compose -f /path/to/nse-stock-tracker/docker-compose.yml \
+          run --rm dbt \
+          dbt run --select marts \
+          --profiles-dir /usr/app/dbt \
+          --project-dir /usr/app/dbt
+    env:
+      CLICKHOUSE_HOST: "{{ vars.clickhouse_host }}"
+      CLICKHOUSE_PORT: "{{ vars.clickhouse_port }}"
+      CLICKHOUSE_DB: "{{ vars.clickhouse_db }}"
+      CLICKHOUSE_USER: "{{ secret('CLICKHOUSE_USER') }}"
+      CLICKHOUSE_PASSWORD: "{{ secret('CLICKHOUSE_PASSWORD') }}"
+
+  - id: dbt_test
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Run dbt tests to validate the mart data before Looker Studio reads it"
+    commands:
+      - |
+        docker compose -f /path/to/nse-stock-tracker/docker-compose.yml \
+          run --rm dbt \
+          dbt test \
+          --profiles-dir /usr/app/dbt \
+          --project-dir /usr/app/dbt
+    allowFailure: true   # don't block the pipeline if tests warn (they will alert below)
+
+  - id: summarise_day
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Print today's market summary to the Kestra execution log"
+    script: |
+      import clickhouse_connect
+      from datetime import date
+
+      client = clickhouse_connect.get_client(
+          host="{{ vars.clickhouse_host }}",
+          port={{ vars.clickhouse_port }},
+          database="{{ vars.clickhouse_db }}",
+          username="{{ secret('CLICKHOUSE_USER') }}",
+          password="{{ secret('CLICKHOUSE_PASSWORD') }}",
+      )
+
+      today = date.today().isoformat()
+
+      # Today's top 3 movers
+      movers = client.query(
+          f"""
+          SELECT ticker, pct_change, direction
+          FROM top_movers
+          WHERE trade_date = '{today}'
+            AND rank <= 3
+          ORDER BY direction, rank
+          """
+      )
+
+      print(f"\n── NSE Summary for {today} ──")
+      for row in movers.result_rows:
+          ticker, pct, direction = row
+          arrow = "↑" if direction == "gainer" else "↓"
+          print(f"  {arrow} {ticker:8s}  {pct:+.2f}%  ({direction})")
+      print()
+
+  - id: log_pipeline_done
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ✅ NSE pipeline complete for today.
+      dbt models refreshed. Dashboard data is up to date.
+      Looker Studio will reflect today's close prices on next refresh.
+
+# ── Error handling ─────────────────────────────────────────────────────────
+errors:
+  - id: notify_on_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: |
+      ❌ NSE pipeline FAILED at task: {{ task.id }}
+      Execution: {{ execution.id }}
+      Error: {{ errorLogs }}
+      
+      Check the Kestra UI at http://localhost:8082 for full logs.
+      Common causes:
+        - Redpanda container stopped (check: docker ps | grep redpanda)
+        - ClickHouse out of disk (check: df -h)
+        - yfinance rate-limited (the producer will auto-retry)

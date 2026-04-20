@@ -1,0 +1,236 @@
+version: "3.8"
+
+# NSE Kenya Stock Tracker - Full Stack
+# Ian Nyaga | The Hague Internet Services | DE Zoomcamp 2026 Capstone
+#
+# Services:
+#   redpanda        → Kafka-compatible message broker (streaming layer)
+#   redpanda-console → Web UI to inspect topics and messages
+#   clickhouse      → Columnar data warehouse (replaces BigQuery)
+#   flink-jm        → Flink JobManager (coordinates the streaming job)
+#   flink-tm        → Flink TaskManager (does the actual work)
+#   kestra          → Workflow orchestrator (schedules polls + dbt runs)
+#   kestra-postgres → Kestra's internal metadata store
+#   dbt             → Transformation layer (runs after each market day)
+
+networks:
+  nse_net:
+    driver: bridge
+
+volumes:
+  redpanda_data:
+  clickhouse_data:
+  kestra_pg_data:
+
+services:
+
+  # ── REDPANDA ───────────────────────────────────────────────────────────────
+  redpanda:
+    image: redpandadata/redpanda:v23.3.11
+    container_name: nse_redpanda
+    networks: [nse_net]
+    ports:
+      - "9092:9092"   # external Kafka API
+      - "29092:29092" # internal Kafka API (used by Flink + producer)
+      - "9644:9644"   # admin API
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:9092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # Topic creation - runs once on startup, then exits
+  redpanda-init:
+    image: redpandadata/redpanda:v23.3.11
+    container_name: nse_redpanda_init
+    networks: [nse_net]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      rpk topic create nse.raw.ticks \
+        --brokers redpanda:29092 \
+        --partitions 3 \
+        --replicas 1 \
+        --topic-config retention.ms=604800000 \
+      && echo 'Topic nse.raw.ticks created'
+      "
+
+  redpanda-console:
+    image: redpandadata/console:v2.4.5
+    container_name: nse_redpanda_console
+    networks: [nse_net]
+    ports:
+      - "8080:8080"
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+    volumes:
+      - ./redpanda-console-config.yml:/tmp/config.yml:ro
+    depends_on:
+      - redpanda
+
+  # ── CLICKHOUSE ─────────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: nse_clickhouse
+    networks: [nse_net]
+    ports:
+      - "8123:8123"  # HTTP interface (Looker Studio, dbt, Python client)
+      - "9000:9000"  # Native TCP interface
+    environment:
+      CLICKHOUSE_DB: nse
+      CLICKHOUSE_USER: nse_user
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD}"
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FLINK ──────────────────────────────────────────────────────────────────
+  flink-jm:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: nse_flink_jobmanager
+    networks: [nse_net]
+    ports:
+      - "8081:8081"  # Flink Web UI
+    environment:
+      - FLINK_ROLE=jobmanager
+      - REDPANDA_BROKER=redpanda:29092
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DB=nse
+      - CLICKHOUSE_USER=nse_user
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+    command: jobmanager
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  flink-tm:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: nse_flink_taskmanager
+    networks: [nse_net]
+    environment:
+      - FLINK_ROLE=taskmanager
+      - REDPANDA_BROKER=redpanda:29092
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DB=nse
+      - CLICKHOUSE_USER=nse_user
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - |
+        FLINK_PROPERTIES=
+        taskmanager.numberOfTaskSlots: 2
+    command: taskmanager
+    depends_on:
+      - flink-jm
+
+  # ── PRODUCER ───────────────────────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: nse_producer
+    networks: [nse_net]
+    environment:
+      - REDPANDA_BROKER=redpanda:29092
+      - POLL_INTERVAL_SECONDS=300
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── KESTRA ─────────────────────────────────────────────────────────────────
+  kestra-postgres:
+    image: postgres:15-alpine
+    container_name: nse_kestra_postgres
+    networks: [nse_net]
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: "${KESTRA_PG_PASSWORD}"
+    volumes:
+      - kestra_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestra"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kestra:
+    image: kestra/kestra:latest
+    container_name: nse_kestra
+    networks: [nse_net]
+    ports:
+      - "8082:8080"  # Kestra UI (8080 is taken by Redpanda Console)
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://kestra-postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: ${KESTRA_PG_PASSWORD}
+        kestra:
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: /app/storage
+          queue:
+            type: postgres
+    volumes:
+      - ./kestra/flows:/app/flows:ro
+    depends_on:
+      kestra-postgres:
+        condition: service_healthy
+
+  # ── DBT ────────────────────────────────────────────────────────────────────
+  # dbt runs as a one-off container invoked by Kestra after market close.
+  # It's also useful to run manually: docker compose run --rm dbt dbt run
+  dbt:
+    image: ghcr.io/dbt-labs/dbt-clickhouse:1.7.2
+    container_name: nse_dbt
+    networks: [nse_net]
+    volumes:
+      - ./dbt:/usr/app/dbt:rw
+    working_dir: /usr/app/dbt
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DB=nse
+      - CLICKHOUSE_USER=nse_user
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+    profiles: ["dbt"]  # only starts when explicitly called
+    depends_on:
+      clickhouse:
+        condition: service_healthy

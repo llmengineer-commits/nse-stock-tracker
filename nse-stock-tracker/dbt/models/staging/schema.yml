@@ -1,0 +1,55 @@
+version: 2
+
+sources:
+  - name: nse_raw
+    database: nse
+    schema: nse
+    description: >
+      Raw tables populated by the PyFlink job. These are the bronze-layer tables
+      that live in ClickHouse and are written to continuously during market hours.
+    tables:
+      - name: raw_ticks
+        description: Every price snapshot polled from yfinance.
+        columns:
+          - name: ticker
+            description: Yahoo Finance ticker symbol (e.g. SCOM.NR)
+            tests: [not_null]
+          - name: price
+            description: Last traded price in KES
+            tests: [not_null]
+          - name: fetched_at
+            description: ISO-8601 timestamp when the producer fetched this data
+            tests: [not_null]
+
+      - name: ohlcv_5min
+        description: 5-minute OHLCV aggregates computed by PyFlink.
+        columns:
+          - name: ticker
+            tests: [not_null]
+          - name: window_start
+            tests: [not_null]
+          - name: close_price
+            tests: [not_null]
+
+models:
+  - name: stg_nse_ticks
+    description: Cleaned and deduplicated tick snapshots from raw_ticks.
+    columns:
+      - name: ticker
+        tests: [not_null]
+      - name: price
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+
+  - name: stg_nse_ohlcv
+    description: Validated 5-minute OHLCV windows from Flink.
+    columns:
+      - name: ticker
+        tests: [not_null]
+      - name: tick_count
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1

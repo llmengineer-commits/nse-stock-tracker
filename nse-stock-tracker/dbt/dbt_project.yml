@@ -1,0 +1,27 @@
+name: nse_tracker
+version: "1.0.0"
+profile: nse_tracker
+config-version: 2
+
+model-paths:   ["models"]
+seed-paths:    ["seeds"]
+test-paths:    ["tests"]
+macro-paths:   ["macros"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# Model defaults
+models:
+  nse_tracker:
+    # Staging layer: views — cheap to query, always fresh
+    staging:
+      +materialized: view
+      +schema: nse
+
+    # Marts layer: tables — pre-computed, fast for Looker Studio
+    marts:
+      +materialized: table
+      +schema: nse
+      # ClickHouse MergeTree config for materialized tables
+      +engine: MergeTree()

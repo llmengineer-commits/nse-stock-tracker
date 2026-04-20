@@ -1,0 +1,15 @@
+nse_tracker:
+  target: dev
+  outputs:
+    dev:
+      type: clickhouse
+      schema: nse
+      host: "{{ env_var('CLICKHOUSE_HOST', 'localhost') }}"
+      port: "{{ env_var('CLICKHOUSE_PORT', '8123') | int }}"
+      user: "{{ env_var('CLICKHOUSE_USER', 'nse_user') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD') }}"
+      secure: false
+      verify: false
+      connect_timeout: 10
+      # Use MergeTree for all materializations — matches our warehouse engine
+      custom_engine_clause: "ENGINE = MergeTree() ORDER BY tuple()"

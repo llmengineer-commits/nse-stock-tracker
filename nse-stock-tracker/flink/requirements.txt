@@ -1,0 +1,2 @@
+apache-flink==1.18.1
+clickhouse-connect==0.7.16

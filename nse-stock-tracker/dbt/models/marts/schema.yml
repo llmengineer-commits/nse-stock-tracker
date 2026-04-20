@@ -1,0 +1,51 @@
+version: 2
+
+models:
+  - name: fct_nse_daily_summary
+    description: >
+      One row per ticker per NSE trading day. The core fact table for the
+      Looker Studio dashboard. Materialised as a ClickHouse table after
+      market close each day by Kestra.
+    columns:
+      - name: trade_date
+        description: NSE trading date (Africa/Nairobi timezone)
+        tests: [not_null]
+      - name: ticker
+        description: Yahoo Finance ticker symbol
+        tests: [not_null]
+      - name: open_price
+        description: First polled price of the day (KES)
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+      - name: close_price
+        description: Last polled price before 15:30 close (KES)
+        tests: [not_null]
+      - name: pct_change
+        description: "(close - open) / open * 100"
+        tests: [not_null]
+      - name: total_ticks
+        description: Number of polls captured today (data quality signal)
+
+  - name: fct_nse_top_movers
+    description: >
+      Top 5 daily gainers and top 5 daily losers. Used for the movers
+      scorecards on the Looker Studio dashboard.
+    columns:
+      - name: trade_date
+        tests: [not_null]
+      - name: direction
+        description: "'gainer' or 'loser'"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["gainer", "loser"]
+      - name: rank
+        description: 1 = biggest mover in that direction
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+              max_value: 5
